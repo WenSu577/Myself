@@ -192,7 +192,8 @@ function renderWidget(ctx, data, refreshMinutes, stale) {
       trendLine(data.points, indexColor, 42),
       metricRow('大盘环比', data.indexChange, indexColor),
       metricRow(klineLabel(data.points), data.kChange, kColor),
-      volumeRow(data, amountColor),
+      row('实时成交额', shortMoney(data.currentAmount), '#AAB3C2', '#FFFFFF'),
+      metricRow('成交额环比', data.amountChange, amountColor),
       compact ? null : lowerPanel(data, large),
       { type: 'spacer' },
       {
@@ -242,11 +243,6 @@ function headline(data, compact, color) {
 
 function metricRow(label, change, color) {
   return row(label, `${signed(change.diff)}  ${signedPct(change.rate)}`, '#AAB3C2', color);
-}
-
-function volumeRow(data, color) {
-  const value = `${shortMoney(data.currentAmount)}  ${signedPct(data.amountChange.rate)}`;
-  return row('成交额环比', value, '#AAB3C2', color);
 }
 
 function lowerPanel(data, large) {
