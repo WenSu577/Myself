@@ -328,8 +328,7 @@ function renderWidget(ctx, data, refreshMinutes, stale) {
       indexBlock(data, compact, indexColor),
       chartBlock(data.points, indexColor, large ? 92 : compact ? 58 : 76),
       metricRow(klineLabel(data.points), data.kChange, kColor),
-      row('实时成交额', shortMoney(data.currentAmount), '#AAB3C2', '#FFFFFF'),
-      metricRow('成交额环比', data.amountChange, amountColor),
+      row('饰品成交额', `${shortMoney(data.currentAmount)}  ${signedPct(data.amountChange.rate)}`, '#AAB3C2', amountColor),
       { type: 'spacer' },
       {
         type: 'text',
