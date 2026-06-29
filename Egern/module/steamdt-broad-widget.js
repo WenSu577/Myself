@@ -9,11 +9,11 @@ export default async function(ctx) {
   const refreshMinutes = Number(ctx.env.REFRESH_MINUTES || 15);
 
   if (!apiKey) {
-    return messageWidget('SteamDT API Key missing', 'Add STEAMDT_API_KEY or API_KEY in widget env.');
+    return messageWidget('缺少 SteamDT API Key', '请在小组件环境变量中添加 API_KEY。');
   }
 
   try {
-    const data = await loadBroadData(ctx, apiKey, klineType);
+    const data = await loadMarketData(ctx, apiKey, klineType);
     ctx.storage.setJSON(CACHE_KEY, { data, cachedAt: Date.now() });
     return renderWidget(ctx, data, refreshMinutes, false);
   } catch (error) {
@@ -21,11 +21,11 @@ export default async function(ctx) {
     if (cached && cached.data) {
       return renderWidget(ctx, cached.data, refreshMinutes, true);
     }
-    return messageWidget('SteamDT load failed', String(error && error.message ? error.message : error));
+    return messageWidget('SteamDT 加载失败', String(error && error.message ? error.message : error));
   }
 }
 
-async function loadBroadData(ctx, apiKey, klineType) {
+async function loadMarketData(ctx, apiKey, klineType) {
   const headers = {
     Authorization: `Bearer ${apiKey}`,
     'Content-Type': 'application/json',
@@ -36,63 +36,48 @@ async function loadBroadData(ctx, apiKey, klineType) {
     requestJSON(ctx, 'POST', KLINE_URL, headers, { type: klineType }),
   ]);
 
-  if (!indexJson.success) {
-    throw new Error(indexJson.errorMsg || 'index api returned false');
-  }
-  if (!klineJson.success) {
-    throw new Error(klineJson.errorMsg || 'kline api returned false');
-  }
+  if (!indexJson.success) throw new Error(indexJson.errorMsg || 'index api returned false');
+  if (!klineJson.success) throw new Error(klineJson.errorMsg || 'kline api returned false');
 
   const index = indexJson.data || {};
-  const kline = normalizeKlineList(klineJson.data || index.historyMarketIndexList || []);
-  const last = lastItem(kline);
-  const prev = kline.length > 1 ? kline[kline.length - 2] : null;
+  const points = normalizeKlineList(klineJson.data || index.historyMarketIndexList || []);
+  const last = lastItem(points);
+  const prev = points.length > 1 ? points[points.length - 2] : null;
 
-  const current = numberOr(index.broadMarketIndex, index.index, index.value, last && last.close);
-  const yesterday = numberOr(index.yesterdayBroadMarketIndex, index.yesterdayIndex, index.lastIndex);
-  const diffYesterday = numberOr(
+  const currentIndex = numberOr(index.broadMarketIndex, index.index, index.value, last && last.close);
+  const prevIndex = numberOr(index.yesterdayBroadMarketIndex, index.yesterdayIndex, index.lastIndex, prev && prev.close);
+  const indexChange = calcChange(
+    currentIndex,
+    prevIndex,
     index.diffYesterday,
-    index.riseFallDiff,
-    current !== null && yesterday !== null ? current - yesterday : null,
-  );
-  const diffYesterdayRatio = numberOr(
     index.diffYesterdayRatio,
+    index.riseFallDiff,
     index.riseFallRate,
-    yesterday ? (diffYesterday / yesterday) * 100 : null,
   );
 
-  const hourDiff = last && prev ? last.close - prev.close : null;
-  const hourRate = last && prev && prev.close ? (hourDiff / prev.close) * 100 : null;
-  const hourAmountDiff = last && prev && last.amount !== null && prev.amount !== null ? last.amount - prev.amount : null;
-  const hourAmountRate = last && prev && prev.amount ? (hourAmountDiff / prev.amount) * 100 : null;
-  const amount = numberOr(index.transactionAmount, index.volumeAmount, index.amount, last && last.amount);
-  const count = numberOr(index.transactionCount, index.volumeCount, index.count, last && last.count);
-  const high = numberOr(index.highIndex, maxOf(kline, 'high'));
-  const low = numberOr(index.lowIndex, minOf(kline, 'low'));
-  const upNum = numberOr(index.upNum, index.riseNum, index.upCount);
-  const flatNum = numberOr(index.flatNum, index.equalNum, index.flatCount);
-  const downNum = numberOr(index.downNum, index.fallNum, index.downCount);
-  const breadthTotal = [upNum, flatNum, downNum].reduce((sum, value) => sum + (Number(value) || 0), 0);
+  const currentK = last ? last.close : currentIndex;
+  const prevK = prev ? prev.close : prevIndex;
+  const kChange = calcChange(currentK, prevK);
+
+  const currentAmount = numberOr(index.transactionAmount, index.volumeAmount, index.amount, last && last.amount);
+  const prevAmount = numberOr(index.lastTransactionAmount, index.yesterdayTransactionAmount, prev && prev.amount);
+  const amountChange = calcChange(
+    currentAmount,
+    prevAmount,
+    index.transactionAmountDiff,
+    index.transactionAmountRate,
+    index.amountDiff,
+    index.amountRate,
+  );
 
   return {
-    current,
-    yesterday,
-    diffYesterday,
-    diffYesterdayRatio,
-    hourDiff,
-    hourRate,
-    amount,
-    count,
-    hourAmountDiff,
-    hourAmountRate,
-    high,
-    low,
-    upNum,
-    flatNum,
-    downNum,
-    breadthTotal,
+    currentIndex,
+    currentAmount,
+    indexChange,
+    kChange,
+    amountChange,
     updateTime: normalizeTime(index.updateTime || (last && last.time)),
-    points: kline.slice(-16),
+    points: points.slice(-18),
   };
 }
 
@@ -106,8 +91,7 @@ async function requestJSON(ctx, method, url, headers, body) {
 }
 
 function normalizeKlineList(raw) {
-  const list = collectKlinePoints(raw);
-  return list
+  return collectKlinePoints(raw)
     .map(normalizeKlinePoint)
     .filter(Boolean)
     .sort((a, b) => a.time - b.time);
@@ -120,12 +104,9 @@ function collectKlinePoints(raw) {
   for (const item of raw) {
     if (!item) continue;
     if (Array.isArray(item)) {
-      const looksLikeTuple = item.length >= 2 && item.some((value) => Number.isFinite(Number(value)));
-      if (looksLikeTuple) {
-        result.push(item);
-      } else {
-        result.push(...collectKlinePoints(item));
-      }
+      const tuple = item.length >= 2 && item.some((value) => Number.isFinite(Number(value)));
+      if (tuple) result.push(item);
+      else result.push(...collectKlinePoints(item));
     } else if (typeof item === 'object') {
       result.push(item);
     }
@@ -140,40 +121,40 @@ function normalizeKlinePoint(item) {
     const time = nums[0] || 0;
     const open = numberOr(nums[1], nums[2]);
     const close = numberOr(nums[2], nums[1]);
-    const low = numberOr(nums[3], Math.min(open, close));
     const high = numberOr(nums[4], Math.max(open, close));
+    const low = numberOr(nums[3], Math.min(open, close));
     const amount = numberOr(nums[5], null);
-    const count = numberOr(nums[6], null);
     if (!isFiniteNumber(close)) return null;
-    return { time, open, close, low, high, amount, count };
+    return { time, open, close, high, low, amount };
   }
 
-  const close = numberOr(item.close, item.c, item.index, item.value, item.price, item.marketIndex, item.broadMarketIndex);
+  const close = numberOr(item.close, item.c, item.index, item.value, item.marketIndex, item.broadMarketIndex);
   if (!isFiniteNumber(close)) return null;
 
-  const open = numberOr(item.open, item.o, close);
-  const high = numberOr(item.high, item.h, Math.max(open, close));
-  const low = numberOr(item.low, item.l, Math.min(open, close));
-  const time = numberOr(item.time, item.timestamp, item.updateTime, item.date, 0);
-  const amount = numberOr(item.transactionAmount, item.volumeAmount, item.amount, item.turnover, null);
-  const count = numberOr(item.transactionCount, item.volumeCount, item.count, null);
-  return { time, open, close, high, low, amount, count };
+  return {
+    time: numberOr(item.time, item.timestamp, item.updateTime, item.date, 0),
+    open: numberOr(item.open, item.o, close),
+    close,
+    high: numberOr(item.high, item.h, close),
+    low: numberOr(item.low, item.l, close),
+    amount: numberOr(item.transactionAmount, item.volumeAmount, item.amount, item.turnover, null),
+  };
 }
 
 function renderWidget(ctx, data, refreshMinutes, stale) {
   const family = ctx.widgetFamily || 'systemMedium';
   const compact = family === 'systemSmall' || family === 'accessoryRectangular';
   const large = family === 'systemLarge' || family === 'systemExtraLarge';
-  const positive = Number(data.diffYesterdayRatio) >= 0;
-  const accent = positive ? '#FF4D5E' : '#20C787';
-  const softAccent = positive ? '#5C2630' : '#1E4C3A';
+  const indexColor = colorBy(data.indexChange.rate);
+  const kColor = colorBy(data.kChange.rate);
+  const amountColor = colorBy(data.amountChange.rate);
 
   if (family === 'accessoryInline') {
     return {
       type: 'widget',
       children: [{
         type: 'text',
-        text: `CS2 ${fmt(data.current)} ${signedPct(data.diffYesterdayRatio)} Amt ${shortMoney(data.amount)}`,
+        text: `CS2大盘 ${fmt(data.currentIndex)} ${signedPct(data.indexChange.rate)} 成交额 ${shortMoney(data.currentAmount)}`,
       }],
     };
   }
@@ -186,16 +167,9 @@ function renderWidget(ctx, data, refreshMinutes, stale) {
       url: 'https://www.steamdt.com/section?type=BROAD',
       backgroundColor: '#151821',
       children: [
-        row('CS2', signedPct(data.diffYesterdayRatio), '#FFFFFF', accent),
-        {
-          type: 'text',
-          text: fmt(data.current),
-          font: { size: 24, weight: 'bold', family: 'Menlo' },
-          textColor: '#FFFFFF',
-          maxLines: 1,
-          minScale: 0.6,
-        },
-        row('Amt', shortMoney(data.amount), '#AAB3C2', '#DCE5F2'),
+        row('指数', signedPct(data.indexChange.rate), '#DCE5F2', indexColor),
+        valueText(fmt(data.currentIndex), 24),
+        row('成交额', shortMoney(data.currentAmount), '#AAB3C2', '#FFFFFF'),
       ],
     };
   }
@@ -214,21 +188,21 @@ function renderWidget(ctx, data, refreshMinutes, stale) {
     refreshAfter: new Date(Date.now() + refreshMinutes * 60 * 1000).toISOString(),
     children: [
       header(stale),
-      indexLine(data, compact, accent),
-      row('vs Yesterday', `${signed(data.diffYesterday)}  ${signedPct(data.diffYesterdayRatio)}`, '#AAB3C2', accent),
-      row('Hourly K', `${signed(data.hourDiff)}  ${signedPct(data.hourRate)}`, '#AAB3C2', colorBy(data.hourRate)),
-      volumeLine(data),
-      compact ? compactDetails(data, accent, softAccent) : detailPanel(data, accent, softAccent, large),
+      headline(data, compact, indexColor),
+      trendLine(data.points, indexColor, 42),
+      metricRow('大盘环比', data.indexChange, indexColor),
+      metricRow(klineLabel(data.points), data.kChange, kColor),
+      volumeRow(data, amountColor),
+      compact ? null : lowerPanel(data, large),
       { type: 'spacer' },
       {
         type: 'text',
-        text: data.updateTime ? `Updated ${data.updateTime}` : 'SteamDT OpenAPI',
+        text: data.updateTime ? `更新 ${data.updateTime}` : 'SteamDT OpenAPI',
         font: { size: 'caption2' },
         textColor: '#7F8A9B',
         maxLines: 1,
-        minScale: 0.8,
       },
-    ],
+    ].filter(Boolean),
   };
 }
 
@@ -240,142 +214,61 @@ function header(stale) {
     gap: 6,
     children: [
       { type: 'image', src: 'sf-symbol:chart.line.uptrend.xyaxis', color: '#8AB4FF', width: 16, height: 16 },
-      { type: 'text', text: stale ? 'CS2 Market · cached' : 'CS2 Market', font: { size: 'caption1', weight: 'semibold' }, textColor: '#DCE5F2' },
+      { type: 'text', text: stale ? 'CS2 大盘 · 缓存' : 'CS2 大盘', font: { size: 'caption1', weight: 'semibold' }, textColor: '#DCE5F2' },
       { type: 'spacer' },
       { type: 'text', text: 'SteamDT', font: { size: 'caption2', weight: 'medium' }, textColor: '#7F8A9B' },
     ],
   };
 }
 
-function indexLine(data, compact, accent) {
+function headline(data, compact, color) {
   return {
     type: 'stack',
     direction: 'row',
     alignItems: 'end',
     gap: 8,
     children: [
+      valueText(fmt(data.currentIndex), compact ? 32 : 38),
       {
         type: 'text',
-        text: fmt(data.current),
-        font: { size: compact ? 32 : 38, weight: 'bold', family: 'Menlo' },
-        textColor: '#FFFFFF',
-        maxLines: 1,
-        minScale: 0.55,
-      },
-      {
-        type: 'text',
-        text: signedPct(data.diffYesterdayRatio),
+        text: signedPct(data.indexChange.rate),
         font: { size: 'caption1', weight: 'bold', family: 'Menlo' },
-        textColor: accent,
+        textColor: color,
         maxLines: 1,
       },
     ],
   };
 }
 
-function volumeLine(data) {
-  const amountMomentum = data.hourAmountRate === null
-    ? shortMoney(data.amount)
-    : `${shortMoney(data.amount)}  ${signedPct(data.hourAmountRate)} HoH`;
-  return row('Turnover', amountMomentum, '#AAB3C2', colorBy(data.hourAmountRate));
+function metricRow(label, change, color) {
+  return row(label, `${signed(change.diff)}  ${signedPct(change.rate)}`, '#AAB3C2', color);
 }
 
-function compactDetails(data, accent, softAccent) {
-  return {
-    type: 'stack',
-    direction: 'column',
-    gap: 8,
-    children: [
-      sparkline(data.points, accent, softAccent, 34),
-      row('Breadth', breadthText(data), '#AAB3C2', '#DCE5F2'),
-    ],
-  };
+function volumeRow(data, color) {
+  const value = `${shortMoney(data.currentAmount)}  ${signedPct(data.amountChange.rate)}`;
+  return row('成交额环比', value, '#AAB3C2', color);
 }
 
-function detailPanel(data, accent, softAccent, large) {
-  const children = [
-    sparkline(data.points, accent, softAccent, large ? 54 : 42),
-    {
-      type: 'stack',
-      direction: 'row',
-      gap: 8,
-      children: [
-        statCard('Trades', shortNumber(data.count), '#263243'),
-        statCard('High', fmt(data.high), '#263243'),
-        statCard('Low', fmt(data.low), '#263243'),
-      ],
-    },
-    breadthBar(data, accent),
+function lowerPanel(data, large) {
+  const cards = [
+    statCard('成交额', shortMoney(data.currentAmount)),
+    statCard('成交额变化', signed(data.amountChange.diff)),
+    statCard(klineLabel(data.points), signedPct(data.kChange.rate)),
   ];
 
   if (large) {
-    children.push({
-      type: 'stack',
-      direction: 'row',
-      gap: 8,
-      children: [
-        statCard('Yesterday', fmt(data.yesterday), '#263243'),
-        statCard('Amt HoH', signedPct(data.hourAmountRate), '#263243'),
-        statCard('K Diff', signed(data.hourDiff), '#263243'),
-      ],
-    });
+    cards.push(statCard('指数变化', signed(data.indexChange.diff)));
   }
 
   return {
     type: 'stack',
-    direction: 'column',
+    direction: 'row',
     gap: 8,
-    children,
+    children: cards,
   };
 }
 
-function statCard(label, value, color) {
-  return {
-    type: 'stack',
-    direction: 'column',
-    gap: 2,
-    flex: 1,
-    padding: [8, 10],
-    backgroundColor: color,
-    borderRadius: 8,
-    children: [
-      { type: 'text', text: label, font: { size: 'caption2' }, textColor: '#AAB3C2', maxLines: 1, minScale: 0.75 },
-      { type: 'text', text: value, font: { size: 'caption1', weight: 'semibold', family: 'Menlo' }, textColor: '#FFFFFF', maxLines: 1, minScale: 0.68 },
-    ],
-  };
-}
-
-function breadthBar(data) {
-  const total = Number(data.breadthTotal) || 0;
-  if (!total) {
-    return row('Breadth', '--', '#AAB3C2', '#DCE5F2');
-  }
-
-  const upFlex = Math.max(1, Number(data.upNum) || 0);
-  const flatFlex = Math.max(1, Number(data.flatNum) || 0);
-  const downFlex = Math.max(1, Number(data.downNum) || 0);
-  return {
-    type: 'stack',
-    direction: 'column',
-    gap: 5,
-    children: [
-      row('Breadth', breadthText(data), '#AAB3C2', '#DCE5F2'),
-      {
-        type: 'stack',
-        direction: 'row',
-        height: 7,
-        gap: 3,
-        children: [
-          { type: 'stack', flex: upFlex, backgroundColor: '#FF4D5E', borderRadius: 4, children: [] },
-          { type: 'stack', flex: flatFlex, backgroundColor: '#8AB4FF', borderRadius: 4, children: [] },
-          { type: 'stack', flex: downFlex, backgroundColor: '#20C787', borderRadius: 4, children: [] },
-        ],
-      },
-    ],
-  };
-}
-
-function sparkline(points, accent, softAccent, height) {
+function trendLine(points, color, height) {
   const values = (points || []).map((item) => item.close).filter(isFiniteNumber);
   if (values.length < 2) {
     return { type: 'spacer', length: height };
@@ -384,34 +277,49 @@ function sparkline(points, accent, softAccent, height) {
   const min = Math.min(...values);
   const max = Math.max(...values);
   const span = max - min || 1;
-  const start = values[0];
-  const bars = values.map((value) => {
-    const ratio = (value - min) / span;
-    return {
-      type: 'stack',
-      direction: 'column',
-      flex: 1,
-      height,
-      children: [
-        { type: 'spacer' },
-        {
-          type: 'stack',
-          height: Math.max(4, Math.round(8 + ratio * (height - 8))),
-          backgroundColor: value >= start ? accent : softAccent,
-          borderRadius: 2,
-          children: [],
-        },
-      ],
-    };
-  });
+  const baseline = values[0];
 
   return {
     type: 'stack',
     direction: 'row',
     alignItems: 'end',
-    gap: 3,
+    gap: 2,
     height,
-    children: bars,
+    children: values.map((value) => {
+      const ratio = (value - min) / span;
+      return {
+        type: 'stack',
+        direction: 'column',
+        flex: 1,
+        height,
+        children: [
+          { type: 'spacer' },
+          {
+            type: 'stack',
+            height: Math.max(3, Math.round(5 + ratio * (height - 5))),
+            backgroundColor: value >= baseline ? color : '#3B4453',
+            borderRadius: 2,
+            children: [],
+          },
+        ],
+      };
+    }),
+  };
+}
+
+function statCard(label, value) {
+  return {
+    type: 'stack',
+    direction: 'column',
+    gap: 2,
+    flex: 1,
+    padding: [8, 10],
+    backgroundColor: '#263243',
+    borderRadius: 8,
+    children: [
+      { type: 'text', text: label, font: { size: 'caption2' }, textColor: '#AAB3C2', maxLines: 1, minScale: 0.7 },
+      { type: 'text', text: value, font: { size: 'caption1', weight: 'semibold', family: 'Menlo' }, textColor: '#FFFFFF', maxLines: 1, minScale: 0.62 },
+    ],
   };
 }
 
@@ -422,10 +330,21 @@ function row(label, value, labelColor, valueColor) {
     alignItems: 'center',
     gap: 6,
     children: [
-      { type: 'text', text: label, font: { size: 'caption1', weight: 'medium' }, textColor: labelColor, maxLines: 1, minScale: 0.75 },
+      { type: 'text', text: label, font: { size: 'caption1', weight: 'medium' }, textColor: labelColor, maxLines: 1, minScale: 0.7 },
       { type: 'spacer' },
-      { type: 'text', text: value, font: { size: 'caption1', weight: 'semibold', family: 'Menlo' }, textColor: valueColor, maxLines: 1, minScale: 0.66 },
+      { type: 'text', text: value, font: { size: 'caption1', weight: 'semibold', family: 'Menlo' }, textColor: valueColor, maxLines: 1, minScale: 0.62 },
     ],
+  };
+}
+
+function valueText(text, size) {
+  return {
+    type: 'text',
+    text,
+    font: { size, weight: 'bold', family: 'Menlo' },
+    textColor: '#FFFFFF',
+    maxLines: 1,
+    minScale: 0.55,
   };
 }
 
@@ -442,9 +361,20 @@ function messageWidget(title, detail) {
   };
 }
 
-function breadthText(data) {
-  if (!data.breadthTotal) return '--';
-  return `${shortNumber(data.upNum)} up · ${shortNumber(data.flatNum)} flat · ${shortNumber(data.downNum)} down`;
+function calcChange(current, previous, apiDiff, apiRate, fallbackDiff, fallbackRate) {
+  const diff = numberOr(apiDiff, fallbackDiff, current !== null && previous !== null ? current - previous : null);
+  const rate = numberOr(apiRate, fallbackRate, previous ? (diff / previous) * 100 : null);
+  return { diff, rate };
+}
+
+function klineLabel(points) {
+  const last = lastItem(points);
+  const prev = points && points.length > 1 ? points[points.length - 2] : null;
+  if (!last || !prev) return 'K线环比';
+
+  const delta = Math.abs(Number(last.time) - Number(prev.time));
+  if (delta >= 20 * 60 * 60 * 1000 || delta >= 20 * 60 * 60) return '日K环比';
+  return '时K环比';
 }
 
 function numberOr(...values) {
@@ -453,16 +383,6 @@ function numberOr(...values) {
     if (Number.isFinite(num)) return num;
   }
   return null;
-}
-
-function maxOf(list, key) {
-  const values = (list || []).map((item) => item[key]).filter(isFiniteNumber);
-  return values.length ? Math.max(...values) : null;
-}
-
-function minOf(list, key) {
-  const values = (list || []).map((item) => item[key]).filter(isFiniteNumber);
-  return values.length ? Math.min(...values) : null;
 }
 
 function isFiniteNumber(value) {
@@ -497,18 +417,12 @@ function signedPct(value) {
   return `${num >= 0 ? '+' : ''}${num.toFixed(2)}%`;
 }
 
-function shortNumber(value) {
-  const num = Number(value);
-  if (!Number.isFinite(num)) return '--';
-  if (Math.abs(num) >= 100000000) return `${trim(num / 100000000)}e`;
-  if (Math.abs(num) >= 10000) return `${trim(num / 10000)}w`;
-  return trim(num);
-}
-
 function shortMoney(value) {
   const num = Number(value);
   if (!Number.isFinite(num)) return '--';
-  return `¥${shortNumber(num)}`;
+  if (Math.abs(num) >= 100000000) return `¥${trim(num / 100000000)}亿`;
+  if (Math.abs(num) >= 10000) return `¥${trim(num / 10000)}万`;
+  return `¥${trim(num)}`;
 }
 
 function trim(value) {
