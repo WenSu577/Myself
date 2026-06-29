@@ -1,0 +1,35 @@
+name: SteamDT CS2 大盘小组件
+description: 显示 CS2 饰品大盘指数、走势、K线环比、实时成交额与成交额环比。指数/K线来自 SteamDT OpenAPI，成交额来自 SteamDT 大盘页 SSR 数据。
+author: Codex
+homepage: https://www.steamdt.com/section?type=BROAD
+
+compat_arguments:
+  SCRIPT_URL:
+    type: text
+    default: ""
+    description: steamdt-broad-widget.js 的可访问 URL
+  API_KEY:
+    type: password
+    default: ""
+    description: SteamDT OpenAPI API_KEY
+  KLINE_TYPE:
+    type: text
+    default: "1"
+    description: SteamDT 大盘 K 线周期类型，官方文档模型范围为 1-3
+  REFRESH_MINUTES:
+    type: text
+    default: "15"
+    description: 小组件刷新间隔，单位分钟
+
+scriptings:
+  - generic:
+      name: steamdt-broad-widget
+      script_url: "{{SCRIPT_URL}}"
+      timeout: 20
+      env:
+        API_KEY: "{{API_KEY}}"
+        KLINE_TYPE: "{{KLINE_TYPE}}"
+        REFRESH_MINUTES: "{{REFRESH_MINUTES}}"
+
+widgets:
+  - name: steamdt-broad-widget
