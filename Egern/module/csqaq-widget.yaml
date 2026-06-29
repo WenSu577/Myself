@@ -1,0 +1,16 @@
+name: "CSQAQ Widget"
+description: "CSQAQ CS2 饰品指数小组件。API_TOKEN 请在脚本环境变量中配置，模块只需要填写脚本地址。"
+author: "Codex"
+homepage: "https://csqaq.com/home"
+
+compat_arguments:
+  SCRIPT_URL: ""
+
+scriptings:
+  - generic:
+      name: "csqaq-widget"
+      script_url: "{{{SCRIPT_URL}}}"
+      timeout: 20
+
+widgets:
+  - name: "csqaq-widget"
