@@ -34,7 +34,7 @@ async function loadMarketData(ctx, apiKey, klineType) {
   const [indexJson, klineJson, publicSnapshot] = await Promise.all([
     requestJSON(ctx, 'GET', INDEX_URL, headers),
     requestJSON(ctx, 'POST', KLINE_URL, headers, { type: klineType }),
-    loadPublicSnapshot(ctx).catch(() => ({})),
+    loadPublicSnapshot(ctx).catch(() => null),
   ]);
 
   if (!indexJson.success) throw new Error(indexJson.errorMsg || 'index api returned false');
@@ -45,15 +45,15 @@ async function loadMarketData(ctx, apiKey, klineType) {
   const last = lastItem(points);
   const prev = points.length > 1 ? points[points.length - 2] : null;
 
-  const currentIndex = numberOr(index.broadMarketIndex, index.index, index.value, last && last.close);
-  const prevIndex = numberOr(index.yesterdayBroadMarketIndex, index.yesterdayIndex, index.lastIndex, prev && prev.close);
+  const currentIndex = numberOr(index.broadMarketIndex, index.index, index.value, publicSnapshot && publicSnapshot.index, last && last.close);
+  const prevIndex = numberOr(index.yesterdayBroadMarketIndex, index.yesterdayIndex, index.lastIndex, publicSnapshot && publicSnapshot.yesterdayIndex, prev && prev.close);
   const indexChange = calcChange(
     currentIndex,
     prevIndex,
     index.diffYesterday,
     index.diffYesterdayRatio,
-    index.riseFallDiff,
-    index.riseFallRate,
+    publicSnapshot && publicSnapshot.riseFallDiff,
+    publicSnapshot && publicSnapshot.riseFallRate,
   );
 
   const currentK = last ? last.close : currentIndex;
@@ -67,7 +67,7 @@ async function loadMarketData(ctx, apiKey, klineType) {
     index.volumeAmount,
     index.amount,
     last && last.amount,
-    publicSnapshot.transactionAmount,
+    publicSnapshot && publicSnapshot.transactionAmount,
   );
   const prevAmount = numberOr(
     index.lastTransactionAmount,
@@ -90,7 +90,7 @@ async function loadMarketData(ctx, apiKey, klineType) {
     indexChange,
     kChange,
     amountChange,
-    updateTime: normalizeTime(index.updateTime || (last && last.time)),
+    updateTime: normalizeTime(index.updateTime || (publicSnapshot && publicSnapshot.updateTime) || (last && last.time)),
     points: points.slice(-24),
   };
 }
@@ -107,40 +107,53 @@ async function requestJSON(ctx, method, url, headers, body) {
 async function loadPublicSnapshot(ctx) {
   const resp = await ctx.http.get('https://www.steamdt.com/section?type=BROAD', { timeout: 10000 });
   const html = await resp.text();
-  return {
-    transactionAmount: parseNuxtNumberAfterKey(html, 'transactionAmount'),
-  };
+  return parseSteamdtSsrBroad(html);
 }
 
-function parseNuxtNumberAfterKey(text, key) {
+function parseSteamdtSsrBroad(text) {
   const match = text.match(/<script[^>]+id="__NUXT_DATA__"[^>]*>([\s\S]*?)<\/script>/);
   if (!match) return null;
 
   try {
-    const root = JSON.parse(match[1]);
-    const ref = findDevalueRef(root, key, new Set());
-    if (!Number.isFinite(ref)) return null;
-    return numberOr(root[ref], null);
+    const table = JSON.parse(match[1]);
+    const broad = findObjectWithKey(table, 'transactionAmount', new Set());
+    if (!broad) return null;
+    return materializeDevalueObject(table, broad);
   } catch (_) {
     return null;
   }
 }
 
-function findDevalueRef(value, key, seen) {
+function findObjectWithKey(value, key, seen) {
   if (!value || typeof value !== 'object' || seen.has(value)) return null;
   seen.add(value);
 
-  if (!Array.isArray(value) && Number.isInteger(value[key])) {
-    return value[key];
+  if (!Array.isArray(value) && Object.prototype.hasOwnProperty.call(value, key)) {
+    return value;
   }
 
   const items = Array.isArray(value) ? value : Object.values(value);
   for (const item of items) {
-    const ref = findDevalueRef(item, key, seen);
-    if (Number.isFinite(ref)) return ref;
+    const found = findObjectWithKey(item, key, seen);
+    if (found) return found;
   }
 
   return null;
+}
+
+function materializeDevalueObject(table, obj) {
+  const out = {};
+  for (const [key, value] of Object.entries(obj)) {
+    out[key] = derefDevalueValue(table, value);
+  }
+  return out;
+}
+
+function derefDevalueValue(table, value) {
+  if (typeof value !== 'number') return value;
+  const target = table[value];
+  if (target === null || ['string', 'number', 'boolean'].includes(typeof target)) return target;
+  return value;
 }
 
 function normalizeKlineList(raw) {
