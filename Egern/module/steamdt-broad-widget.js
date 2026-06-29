@@ -77,9 +77,9 @@ async function loadMarketData(ctx, apiKey, klineType) {
   );
   const amountChange = calcChange(
     currentAmount,
-    prevAmount,
+    numberOr(publicSnapshot && publicSnapshot.previousTransactionAmount, prevAmount),
     index.transactionAmountDiff,
-    index.transactionAmountRate,
+    publicSnapshot && publicSnapshot.transactionAmountRate,
     index.amountDiff,
     index.amountRate,
   );
@@ -105,9 +105,13 @@ async function requestJSON(ctx, method, url, headers, body) {
 }
 
 async function loadPublicSnapshot(ctx) {
-  const resp = await ctx.http.get('https://www.steamdt.com/section?type=BROAD', { timeout: 10000 });
-  const html = await responseText(resp);
-  return parseSteamdtSsrBroad(html);
+  const [sectionResp, homeResp] = await Promise.all([
+    ctx.http.get('https://www.steamdt.com/section?type=BROAD', { timeout: 10000 }),
+    ctx.http.get('https://www.steamdt.com', { timeout: 10000 }).catch(() => null),
+  ]);
+  const section = parseSteamdtSsrBroad(await responseText(sectionResp));
+  const home = homeResp ? parseSteamdtHomeSnapshot(await responseText(homeResp)) : null;
+  return Object.assign({}, section || {}, home || {});
 }
 
 async function responseText(resp) {
@@ -128,6 +132,39 @@ function parseSteamdtSsrBroad(text) {
     const broad = findObjectWithKey(table, 'transactionAmount', new Set());
     if (!broad) return null;
     return materializeDevalueObject(table, broad);
+  } catch (_) {
+    return null;
+  }
+}
+
+function parseSteamdtHomeSnapshot(text) {
+  const match = text.match(/<script[^>]+id="__NUXT_DATA__"[^>]*>([\s\S]*?)<\/script>/);
+  if (!match) return null;
+
+  try {
+    const table = JSON.parse(match[1]);
+    const rows = [];
+    for (const value of table) {
+      if (!Array.isArray(value) || value.length < 3) continue;
+      const date = derefDevalueValue(table, value[0]);
+      const amount = numberOr(derefDevalueValue(table, value[1]), null);
+      const count = numberOr(derefDevalueValue(table, value[2]), null);
+      if (typeof date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(date) && amount !== null) {
+        rows.push({ date, amount, count });
+      }
+    }
+
+    rows.sort((a, b) => a.date.localeCompare(b.date));
+    const latest = rows[rows.length - 1];
+    const previous = rows[rows.length - 2];
+    if (!latest || !previous) return null;
+
+    const diff = latest.amount - previous.amount;
+    return {
+      historyTransactionAmount: latest.amount,
+      previousTransactionAmount: previous.amount,
+      transactionAmountRate: previous.amount ? (diff / previous.amount) * 100 : null,
+    };
   } catch (_) {
     return null;
   }
@@ -378,8 +415,9 @@ function metricRow(label, change, color) {
 }
 
 function trendBars(points, color, height) {
-  const values = (points || []).map((item) => item.close).filter(isFiniteNumber);
-  if (values.length < 2) {
+  const items = (points || []).filter((item) => isFiniteNumber(item.close));
+  const values = items.map((item) => Number(item.close));
+  if (items.length < 2) {
     return {
       type: 'text',
       text: '暂无走势数据',
@@ -392,7 +430,6 @@ function trendBars(points, color, height) {
   const min = Math.min(...values);
   const max = Math.max(...values);
   const span = max - min || 1;
-  const baseline = values[0];
 
   return {
     type: 'stack',
@@ -403,9 +440,11 @@ function trendBars(points, color, height) {
     backgroundColor: '#182231',
     borderRadius: 8,
     padding: [7, 8],
-    children: values.map((value) => {
+    children: items.map((item) => {
+      const value = Number(item.close);
       const ratio = (value - min) / span;
       const barHeight = Math.max(4, Math.round(6 + ratio * (height - 20)));
+      const rising = Number(item.close) >= Number(item.open);
       return {
         type: 'stack',
         direction: 'column',
@@ -416,7 +455,7 @@ function trendBars(points, color, height) {
           {
             type: 'stack',
             height: barHeight,
-            backgroundColor: value >= baseline ? color : '#465366',
+            backgroundColor: rising ? '#FF4D5E' : '#20C787',
             borderRadius: 2,
             children: [{ type: 'spacer' }],
           },
