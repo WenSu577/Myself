@@ -77,7 +77,7 @@ async function loadMarketData(ctx, apiKey, klineType) {
     kChange,
     amountChange,
     updateTime: normalizeTime(index.updateTime || (last && last.time)),
-    points: points.slice(-18),
+    points: points.slice(-24),
   };
 }
 
@@ -154,7 +154,7 @@ function renderWidget(ctx, data, refreshMinutes, stale) {
       type: 'widget',
       children: [{
         type: 'text',
-        text: `CS2大盘 ${fmt(data.currentIndex)} ${signedPct(data.indexChange.rate)} 成交额 ${shortMoney(data.currentAmount)}`,
+        text: `CS2大盘 ${fmt(data.currentIndex)} ${signed(data.indexChange.diff)} ${signedPct(data.indexChange.rate)}`,
       }],
     };
   }
@@ -167,7 +167,7 @@ function renderWidget(ctx, data, refreshMinutes, stale) {
       url: 'https://www.steamdt.com/section?type=BROAD',
       backgroundColor: '#151821',
       children: [
-        row('指数', signedPct(data.indexChange.rate), '#DCE5F2', indexColor),
+        row('指数', `${signed(data.indexChange.diff)} ${signedPct(data.indexChange.rate)}`, '#DCE5F2', indexColor),
         valueText(fmt(data.currentIndex), 24),
         row('成交额', shortMoney(data.currentAmount), '#AAB3C2', '#FFFFFF'),
       ],
@@ -188,13 +188,11 @@ function renderWidget(ctx, data, refreshMinutes, stale) {
     refreshAfter: new Date(Date.now() + refreshMinutes * 60 * 1000).toISOString(),
     children: [
       header(stale),
-      headline(data, compact, indexColor),
-      trendLine(data.points, indexColor, 42),
-      metricRow('大盘环比', data.indexChange, indexColor),
+      indexBlock(data, compact, indexColor),
+      chartBlock(data.points, indexColor, large ? 92 : compact ? 58 : 76),
       metricRow(klineLabel(data.points), data.kChange, kColor),
       row('实时成交额', shortMoney(data.currentAmount), '#AAB3C2', '#FFFFFF'),
       metricRow('成交额环比', data.amountChange, amountColor),
-      compact ? null : lowerPanel(data, large),
       { type: 'spacer' },
       {
         type: 'text',
@@ -203,7 +201,7 @@ function renderWidget(ctx, data, refreshMinutes, stale) {
         textColor: '#7F8A9B',
         maxLines: 1,
       },
-    ].filter(Boolean),
+    ],
   };
 }
 
@@ -222,46 +220,61 @@ function header(stale) {
   };
 }
 
-function headline(data, compact, color) {
+function indexBlock(data, compact, color) {
   return {
     type: 'stack',
     direction: 'row',
     alignItems: 'end',
     gap: 8,
     children: [
-      valueText(fmt(data.currentIndex), compact ? 32 : 38),
+      valueText(fmt(data.currentIndex), compact ? 34 : 42),
+      {
+        type: 'stack',
+        direction: 'column',
+        alignItems: 'end',
+        gap: 2,
+        padding: [0, 0, 4, 0],
+        children: [
+          {
+            type: 'text',
+            text: signed(data.indexChange.diff),
+            font: { size: 'caption2', weight: 'bold', family: 'Menlo' },
+            textColor: color,
+            maxLines: 1,
+          },
+          {
+            type: 'text',
+            text: signedPct(data.indexChange.rate),
+            font: { size: 'caption1', weight: 'bold', family: 'Menlo' },
+            textColor: color,
+            maxLines: 1,
+          },
+        ],
+      },
+    ],
+  };
+}
+
+function chartBlock(points, color, height) {
+  return {
+    type: 'stack',
+    direction: 'column',
+    gap: 5,
+    children: [
       {
         type: 'text',
-        text: signedPct(data.indexChange.rate),
-        font: { size: 'caption1', weight: 'bold', family: 'Menlo' },
-        textColor: color,
+        text: '大盘走势',
+        font: { size: 'caption2', weight: 'medium' },
+        textColor: '#7F8A9B',
         maxLines: 1,
       },
+      trendLine(points, color, height),
     ],
   };
 }
 
 function metricRow(label, change, color) {
   return row(label, `${signed(change.diff)}  ${signedPct(change.rate)}`, '#AAB3C2', color);
-}
-
-function lowerPanel(data, large) {
-  const cards = [
-    statCard('成交额', shortMoney(data.currentAmount)),
-    statCard('成交额变化', signed(data.amountChange.diff)),
-    statCard(klineLabel(data.points), signedPct(data.kChange.rate)),
-  ];
-
-  if (large) {
-    cards.push(statCard('指数变化', signed(data.indexChange.diff)));
-  }
-
-  return {
-    type: 'stack',
-    direction: 'row',
-    gap: 8,
-    children: cards,
-  };
 }
 
 function trendLine(points, color, height) {
@@ -292,7 +305,7 @@ function trendLine(points, color, height) {
           { type: 'spacer' },
           {
             type: 'stack',
-            height: Math.max(3, Math.round(5 + ratio * (height - 5))),
+            height: Math.max(4, Math.round(6 + ratio * (height - 6))),
             backgroundColor: value >= baseline ? color : '#3B4453',
             borderRadius: 2,
             children: [],
@@ -300,22 +313,6 @@ function trendLine(points, color, height) {
         ],
       };
     }),
-  };
-}
-
-function statCard(label, value) {
-  return {
-    type: 'stack',
-    direction: 'column',
-    gap: 2,
-    flex: 1,
-    padding: [8, 10],
-    backgroundColor: '#263243',
-    borderRadius: 8,
-    children: [
-      { type: 'text', text: label, font: { size: 'caption2' }, textColor: '#AAB3C2', maxLines: 1, minScale: 0.7 },
-      { type: 'text', text: value, font: { size: 'caption1', weight: 'semibold', family: 'Menlo' }, textColor: '#FFFFFF', maxLines: 1, minScale: 0.62 },
-    ],
   };
 }
 
