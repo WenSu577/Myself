@@ -68,6 +68,7 @@ async function loadMarketData(ctx, apiKey, klineType) {
     index.volumeAmount,
     index.amount,
     last && last.amount,
+    publicSnapshot && publicSnapshot.homeTurnover,
   );
   const prevAmount = numberOr(
     index.lastTransactionAmount,
@@ -77,7 +78,7 @@ async function loadMarketData(ctx, apiKey, klineType) {
   );
   const amountChange = calcChange(
     currentAmount,
-    numberOr(publicSnapshot && publicSnapshot.previousTransactionAmount, prevAmount),
+    prevAmount,
     index.transactionAmountDiff,
     publicSnapshot && publicSnapshot.transactionAmountRate,
     index.amountDiff,
@@ -90,6 +91,7 @@ async function loadMarketData(ctx, apiKey, klineType) {
     indexChange,
     kChange,
     amountChange,
+    mood: buildMarketMood(publicSnapshot),
     updateTime: normalizeTime(index.updateTime || (publicSnapshot && publicSnapshot.updateTime) || (last && last.time)),
     points: points.slice(-24),
   };
@@ -143,27 +145,12 @@ function parseSteamdtHomeSnapshot(text) {
 
   try {
     const table = JSON.parse(match[1]);
-    const rows = [];
-    for (const value of table) {
-      if (!Array.isArray(value) || value.length < 3) continue;
-      const date = derefDevalueValue(table, value[0]);
-      const amount = numberOr(derefDevalueValue(table, value[1]), null);
-      const count = numberOr(derefDevalueValue(table, value[2]), null);
-      if (typeof date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(date) && amount !== null) {
-        rows.push({ date, amount, count });
-      }
-    }
-
-    rows.sort((a, b) => a.date.localeCompare(b.date));
-    const latest = rows[rows.length - 1];
-    const previous = rows[rows.length - 2];
-    if (!latest || !previous) return null;
-
-    const diff = latest.amount - previous.amount;
+    const market = findObjectWithKey(table, 'tradeAmountRatio', new Set());
+    if (!market) return null;
+    const data = materializeDevalueObject(table, market);
     return {
-      historyTransactionAmount: latest.amount,
-      previousTransactionAmount: previous.amount,
-      transactionAmountRate: previous.amount ? (diff / previous.amount) * 100 : null,
+      homeTurnover: numberOr(data.turnover, null),
+      transactionAmountRate: numberOr(data.tradeAmountRatio, null),
     };
   } catch (_) {
     return null;
@@ -329,6 +316,7 @@ function renderWidget(ctx, data, refreshMinutes, stale) {
       chartBlock(data.points, indexColor, large ? 92 : compact ? 58 : 76),
       metricRow(klineLabel(data.points), data.kChange, kColor),
       row('饰品成交额', `${shortMoney(data.currentAmount)}  ${signedPct(data.amountChange.rate)}`, '#AAB3C2', amountColor),
+      marketMoodRow(data.mood),
       { type: 'spacer' },
       {
         type: 'text',
@@ -411,6 +399,38 @@ function chartBlock(points, color, height) {
 
 function metricRow(label, change, color) {
   return row(label, `${signed(change.diff)}  ${signedPct(change.rate)}`, '#AAB3C2', color);
+}
+
+function marketMoodRow(mood) {
+  if (!mood || !mood.total) {
+    return row('市场情绪', '未取到', '#AAB3C2', '#DCE5F2');
+  }
+  return row('市场情绪', `${mood.label}  ${mood.upPct}%↑ / ${mood.downPct}%↓`, '#AAB3C2', mood.color);
+}
+
+function buildMarketMood(snapshot) {
+  if (!snapshot) return null;
+  const up = numberOr(snapshot.upNum, null);
+  const flat = numberOr(snapshot.flatNum, null);
+  const down = numberOr(snapshot.downNum, null);
+  const total = (up || 0) + (flat || 0) + (down || 0);
+  if (!total) return null;
+
+  const upPct = Math.round((up / total) * 100);
+  const downPct = Math.round((down / total) * 100);
+  const spread = upPct - downPct;
+  let label = '均衡';
+  let color = '#8AB4FF';
+
+  if (spread >= 8) {
+    label = '偏强';
+    color = '#FF4D5E';
+  } else if (spread <= -8) {
+    label = '偏弱';
+    color = '#20C787';
+  }
+
+  return { label, color, up, flat, down, total, upPct, downPct };
 }
 
 function trendBars(points, color, height) {
