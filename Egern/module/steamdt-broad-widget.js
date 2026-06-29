@@ -31,16 +31,17 @@ async function loadMarketData(ctx, apiKey, klineType) {
     'Content-Type': 'application/json',
   };
 
-  const [indexJson, klineJson] = await Promise.all([
+  const [indexJson, klineJson, publicSnapshot] = await Promise.all([
     requestJSON(ctx, 'GET', INDEX_URL, headers),
     requestJSON(ctx, 'POST', KLINE_URL, headers, { type: klineType }),
+    loadPublicSnapshot(ctx).catch(() => ({})),
   ]);
 
   if (!indexJson.success) throw new Error(indexJson.errorMsg || 'index api returned false');
   if (!klineJson.success) throw new Error(klineJson.errorMsg || 'kline api returned false');
 
   const index = indexJson.data || {};
-  const points = normalizeKlineList(klineJson.data || index.historyMarketIndexList || []);
+  const points = normalizeKlineList(klineJson.data || index.historyMarketIndexList || publicSnapshot.points || []);
   const last = lastItem(points);
   const prev = points.length > 1 ? points[points.length - 2] : null;
 
@@ -59,8 +60,21 @@ async function loadMarketData(ctx, apiKey, klineType) {
   const prevK = prev ? prev.close : prevIndex;
   const kChange = calcChange(currentK, prevK);
 
-  const currentAmount = numberOr(index.transactionAmount, index.volumeAmount, index.amount, last && last.amount);
-  const prevAmount = numberOr(index.lastTransactionAmount, index.yesterdayTransactionAmount, prev && prev.amount);
+  const currentAmount = numberOr(
+    index.transactionAmount,
+    index.transactionAmt,
+    index.turnover,
+    index.volumeAmount,
+    index.amount,
+    last && last.amount,
+    publicSnapshot.transactionAmount,
+  );
+  const prevAmount = numberOr(
+    index.lastTransactionAmount,
+    index.yesterdayTransactionAmount,
+    index.yesterdayAmount,
+    prev && prev.amount,
+  );
   const amountChange = calcChange(
     currentAmount,
     prevAmount,
@@ -90,6 +104,45 @@ async function requestJSON(ctx, method, url, headers, body) {
   return await resp.json();
 }
 
+async function loadPublicSnapshot(ctx) {
+  const resp = await ctx.http.get('https://www.steamdt.com/section?type=BROAD', { timeout: 10000 });
+  const html = await resp.text();
+  return {
+    transactionAmount: parseNuxtNumberAfterKey(html, 'transactionAmount'),
+  };
+}
+
+function parseNuxtNumberAfterKey(text, key) {
+  const match = text.match(/<script[^>]+id="__NUXT_DATA__"[^>]*>([\s\S]*?)<\/script>/);
+  if (!match) return null;
+
+  try {
+    const root = JSON.parse(match[1]);
+    const ref = findDevalueRef(root, key, new Set());
+    if (!Number.isFinite(ref)) return null;
+    return numberOr(root[ref], null);
+  } catch (_) {
+    return null;
+  }
+}
+
+function findDevalueRef(value, key, seen) {
+  if (!value || typeof value !== 'object' || seen.has(value)) return null;
+  seen.add(value);
+
+  if (!Array.isArray(value) && Number.isInteger(value[key])) {
+    return value[key];
+  }
+
+  const items = Array.isArray(value) ? value : Object.values(value);
+  for (const item of items) {
+    const ref = findDevalueRef(item, key, seen);
+    if (Number.isFinite(ref)) return ref;
+  }
+
+  return null;
+}
+
 function normalizeKlineList(raw) {
   return collectKlinePoints(raw)
     .map(normalizeKlinePoint)
@@ -98,6 +151,10 @@ function normalizeKlineList(raw) {
 }
 
 function collectKlinePoints(raw) {
+  if (!raw) return [];
+  if (!Array.isArray(raw) && typeof raw === 'object') {
+    return collectObjectKlinePoints(raw, 0);
+  }
   if (!Array.isArray(raw)) return [];
   const result = [];
 
@@ -113,6 +170,27 @@ function collectKlinePoints(raw) {
   }
 
   return result;
+}
+
+function collectObjectKlinePoints(raw, depth) {
+  if (!raw || depth > 6) return [];
+
+  const result = [];
+  if (hasKlineValue(raw)) result.push(raw);
+
+  for (const value of Object.values(raw)) {
+    if (Array.isArray(value)) {
+      result.push(...collectKlinePoints(value));
+    } else if (value && typeof value === 'object') {
+      result.push(...collectObjectKlinePoints(value, depth + 1));
+    }
+  }
+
+  return result;
+}
+
+function hasKlineValue(item) {
+  return ['close', 'c', 'index', 'value', 'marketIndex', 'broadMarketIndex'].some((key) => isFiniteNumber(item[key]));
 }
 
 function normalizeKlinePoint(item) {
@@ -256,6 +334,7 @@ function indexBlock(data, compact, color) {
 }
 
 function chartBlock(points, color, height) {
+  const chart = chartImage(points, color, height);
   return {
     type: 'stack',
     direction: 'column',
@@ -268,7 +347,7 @@ function chartBlock(points, color, height) {
         textColor: '#7F8A9B',
         maxLines: 1,
       },
-      trendLine(points, color, height),
+      chart,
     ],
   };
 }
@@ -277,43 +356,54 @@ function metricRow(label, change, color) {
   return row(label, `${signed(change.diff)}  ${signedPct(change.rate)}`, '#AAB3C2', color);
 }
 
-function trendLine(points, color, height) {
-  const values = (points || []).map((item) => item.close).filter(isFiniteNumber);
-  if (values.length < 2) {
-    return { type: 'spacer', length: height };
+function chartImage(points, color, height) {
+  const src = chartSvgDataUri(points, color, 320, height);
+  if (!src) {
+    return {
+      type: 'text',
+      text: '暂无走势数据',
+      font: { size: 'caption1' },
+      textColor: '#7F8A9B',
+      height,
+    };
   }
+
+  return {
+    type: 'image',
+    src,
+    height,
+    resizeMode: 'cover',
+  };
+}
+
+function chartSvgDataUri(points, color, width, height) {
+  const values = (points || []).map((item) => item.close).filter(isFiniteNumber);
+  if (values.length < 2) return '';
 
   const min = Math.min(...values);
   const max = Math.max(...values);
   const span = max - min || 1;
-  const baseline = values[0];
+  const pad = 8;
+  const usableW = width - pad * 2;
+  const usableH = height - pad * 2;
+  const coords = values.map((value, index) => {
+    const x = pad + (index / (values.length - 1)) * usableW;
+    const y = pad + (1 - (value - min) / span) * usableH;
+    return [round(x), round(y)];
+  });
+  const line = coords.map(([x, y]) => `${x},${y}`).join(' ');
+  const area = `${pad},${height - pad} ${line} ${width - pad},${height - pad}`;
+  const gridY = round(height - pad);
+  const svg = [
+    `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">`,
+    `<rect width="${width}" height="${height}" rx="10" fill="#182231"/>`,
+    `<line x1="${pad}" y1="${gridY}" x2="${width - pad}" y2="${gridY}" stroke="#334155" stroke-width="1"/>`,
+    `<polygon points="${area}" fill="${color}" opacity="0.16"/>`,
+    `<polyline points="${line}" fill="none" stroke="${color}" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>`,
+    `</svg>`,
+  ].join('');
 
-  return {
-    type: 'stack',
-    direction: 'row',
-    alignItems: 'end',
-    gap: 2,
-    height,
-    children: values.map((value) => {
-      const ratio = (value - min) / span;
-      return {
-        type: 'stack',
-        direction: 'column',
-        flex: 1,
-        height,
-        children: [
-          { type: 'spacer' },
-          {
-            type: 'stack',
-            height: Math.max(4, Math.round(6 + ratio * (height - 6))),
-            backgroundColor: value >= baseline ? color : '#3B4453',
-            borderRadius: 2,
-            children: [],
-          },
-        ],
-      };
-    }),
-  };
+  return `data:image/svg+xml;base64,${base64Ascii(svg)}`;
 }
 
 function row(label, value, labelColor, valueColor) {
@@ -408,6 +498,38 @@ function signedPct(value) {
   const num = Number(value);
   if (!Number.isFinite(num)) return '--';
   return `${num >= 0 ? '+' : ''}${num.toFixed(2)}%`;
+}
+
+function round(value) {
+  return Math.round(value * 10) / 10;
+}
+
+function base64Ascii(value) {
+  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=';
+  let output = '';
+  let i = 0;
+
+  while (i < value.length) {
+    const chr1 = value.charCodeAt(i++);
+    const chr2 = value.charCodeAt(i++);
+    const chr3 = value.charCodeAt(i++);
+
+    const enc1 = chr1 >> 2;
+    const enc2 = ((chr1 & 3) << 4) | (chr2 >> 4);
+    let enc3 = ((chr2 & 15) << 2) | (chr3 >> 6);
+    let enc4 = chr3 & 63;
+
+    if (Number.isNaN(chr2)) {
+      enc3 = 64;
+      enc4 = 64;
+    } else if (Number.isNaN(chr3)) {
+      enc4 = 64;
+    }
+
+    output += chars.charAt(enc1) + chars.charAt(enc2) + chars.charAt(enc3) + chars.charAt(enc4);
+  }
+
+  return output;
 }
 
 function shortMoney(value) {
