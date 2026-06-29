@@ -32,15 +32,15 @@ async function loadMarketData(ctx, apiKey, klineType) {
   };
 
   const [indexJson, klineJson, publicSnapshot] = await Promise.all([
-    requestJSON(ctx, 'GET', INDEX_URL, headers),
+    requestJSON(ctx, 'GET', INDEX_URL, headers).catch((error) => ({ success: false, error })),
     requestJSON(ctx, 'POST', KLINE_URL, headers, { type: klineType }),
     loadPublicSnapshot(ctx).catch(() => null),
   ]);
 
-  if (!indexJson.success) throw new Error(indexJson.errorMsg || 'index api returned false');
+  if (!indexJson.success && !publicSnapshot) throw new Error(indexJson.errorMsg || 'index api returned false');
   if (!klineJson.success) throw new Error(klineJson.errorMsg || 'kline api returned false');
 
-  const index = indexJson.data || {};
+  const index = indexJson.success ? (indexJson.data || {}) : {};
   const points = normalizeKlineList(klineJson.data || index.historyMarketIndexList || publicSnapshot.points || []);
   const last = lastItem(points);
   const prev = points.length > 1 ? points[points.length - 2] : null;
@@ -61,13 +61,13 @@ async function loadMarketData(ctx, apiKey, klineType) {
   const kChange = calcChange(currentK, prevK);
 
   const currentAmount = numberOr(
+    publicSnapshot && publicSnapshot.transactionAmount,
     index.transactionAmount,
     index.transactionAmt,
     index.turnover,
     index.volumeAmount,
     index.amount,
     last && last.amount,
-    publicSnapshot && publicSnapshot.transactionAmount,
   );
   const prevAmount = numberOr(
     index.lastTransactionAmount,
@@ -106,8 +106,17 @@ async function requestJSON(ctx, method, url, headers, body) {
 
 async function loadPublicSnapshot(ctx) {
   const resp = await ctx.http.get('https://www.steamdt.com/section?type=BROAD', { timeout: 10000 });
-  const html = await resp.text();
+  const html = await responseText(resp);
   return parseSteamdtSsrBroad(html);
+}
+
+async function responseText(resp) {
+  if (!resp) return '';
+  if (typeof resp.text === 'function') return await resp.text();
+  if (typeof resp.body === 'string') return resp.body;
+  if (typeof resp.rawBody === 'string') return resp.rawBody;
+  if (resp.data && typeof resp.data === 'string') return resp.data;
+  return '';
 }
 
 function parseSteamdtSsrBroad(text) {
@@ -212,8 +221,8 @@ function normalizeKlinePoint(item) {
     const time = nums[0] || 0;
     const open = numberOr(nums[1], nums[2]);
     const close = numberOr(nums[2], nums[1]);
-    const high = numberOr(nums[4], Math.max(open, close));
-    const low = numberOr(nums[3], Math.min(open, close));
+    const high = numberOr(nums[3], Math.max(open, close));
+    const low = numberOr(nums[4], Math.min(open, close));
     const amount = numberOr(nums[5], null);
     if (!isFiniteNumber(close)) return null;
     return { time, open, close, high, low, amount };
@@ -347,7 +356,6 @@ function indexBlock(data, compact, color) {
 }
 
 function chartBlock(points, color, height) {
-  const chart = chartImage(points, color, height);
   return {
     type: 'stack',
     direction: 'column',
@@ -360,7 +368,7 @@ function chartBlock(points, color, height) {
         textColor: '#7F8A9B',
         maxLines: 1,
       },
-      chart,
+      trendBars(points, color, height),
     ],
   };
 }
@@ -369,9 +377,9 @@ function metricRow(label, change, color) {
   return row(label, `${signed(change.diff)}  ${signedPct(change.rate)}`, '#AAB3C2', color);
 }
 
-function chartImage(points, color, height) {
-  const src = chartSvgDataUri(points, color, 320, height);
-  if (!src) {
+function trendBars(points, color, height) {
+  const values = (points || []).map((item) => item.close).filter(isFiniteNumber);
+  if (values.length < 2) {
     return {
       type: 'text',
       text: '暂无走势数据',
@@ -381,42 +389,41 @@ function chartImage(points, color, height) {
     };
   }
 
-  return {
-    type: 'image',
-    src,
-    height,
-    resizeMode: 'cover',
-  };
-}
-
-function chartSvgDataUri(points, color, width, height) {
-  const values = (points || []).map((item) => item.close).filter(isFiniteNumber);
-  if (values.length < 2) return '';
-
   const min = Math.min(...values);
   const max = Math.max(...values);
   const span = max - min || 1;
-  const pad = 8;
-  const usableW = width - pad * 2;
-  const usableH = height - pad * 2;
-  const coords = values.map((value, index) => {
-    const x = pad + (index / (values.length - 1)) * usableW;
-    const y = pad + (1 - (value - min) / span) * usableH;
-    return [round(x), round(y)];
-  });
-  const line = coords.map(([x, y]) => `${x},${y}`).join(' ');
-  const area = `${pad},${height - pad} ${line} ${width - pad},${height - pad}`;
-  const gridY = round(height - pad);
-  const svg = [
-    `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">`,
-    `<rect width="${width}" height="${height}" rx="10" fill="#182231"/>`,
-    `<line x1="${pad}" y1="${gridY}" x2="${width - pad}" y2="${gridY}" stroke="#334155" stroke-width="1"/>`,
-    `<polygon points="${area}" fill="${color}" opacity="0.16"/>`,
-    `<polyline points="${line}" fill="none" stroke="${color}" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>`,
-    `</svg>`,
-  ].join('');
+  const baseline = values[0];
 
-  return `data:image/svg+xml;base64,${base64Ascii(svg)}`;
+  return {
+    type: 'stack',
+    direction: 'row',
+    alignItems: 'end',
+    gap: 2,
+    height,
+    backgroundColor: '#182231',
+    borderRadius: 8,
+    padding: [7, 8],
+    children: values.map((value) => {
+      const ratio = (value - min) / span;
+      const barHeight = Math.max(4, Math.round(6 + ratio * (height - 20)));
+      return {
+        type: 'stack',
+        direction: 'column',
+        flex: 1,
+        height: height - 14,
+        children: [
+          { type: 'spacer' },
+          {
+            type: 'stack',
+            height: barHeight,
+            backgroundColor: value >= baseline ? color : '#465366',
+            borderRadius: 2,
+            children: [{ type: 'spacer' }],
+          },
+        ],
+      };
+    }),
+  };
 }
 
 function row(label, value, labelColor, valueColor) {
@@ -513,41 +520,9 @@ function signedPct(value) {
   return `${num >= 0 ? '+' : ''}${num.toFixed(2)}%`;
 }
 
-function round(value) {
-  return Math.round(value * 10) / 10;
-}
-
-function base64Ascii(value) {
-  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=';
-  let output = '';
-  let i = 0;
-
-  while (i < value.length) {
-    const chr1 = value.charCodeAt(i++);
-    const chr2 = value.charCodeAt(i++);
-    const chr3 = value.charCodeAt(i++);
-
-    const enc1 = chr1 >> 2;
-    const enc2 = ((chr1 & 3) << 4) | (chr2 >> 4);
-    let enc3 = ((chr2 & 15) << 2) | (chr3 >> 6);
-    let enc4 = chr3 & 63;
-
-    if (Number.isNaN(chr2)) {
-      enc3 = 64;
-      enc4 = 64;
-    } else if (Number.isNaN(chr3)) {
-      enc4 = 64;
-    }
-
-    output += chars.charAt(enc1) + chars.charAt(enc2) + chars.charAt(enc3) + chars.charAt(enc4);
-  }
-
-  return output;
-}
-
 function shortMoney(value) {
   const num = Number(value);
-  if (!Number.isFinite(num)) return '--';
+  if (!Number.isFinite(num)) return '未取到';
   if (Math.abs(num) >= 100000000) return `¥${trim(num / 100000000)}亿`;
   if (Math.abs(num) >= 10000) return `¥${trim(num / 10000)}万`;
   return `¥${trim(num)}`;
